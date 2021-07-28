@@ -1,0 +1,433 @@
+service: etl-pipeline
+
+plugins:
+  - serverless-python-requirements
+  - serverless-s3-deploy
+  - serverless-prune-plugin
+  - serverless-step-functions
+
+custom:
+  etl:
+    # Comma-separated values, no spaces. E.g. 'year,month,day,hour'
+    partitions: "year,month,day,hour"
+  assets:
+    resolveReferences: true
+    auto: true
+    targets:
+      - bucket:
+          !Ref TransformationJobScriptS3Bucket
+        files:
+          - source: ./job-scripts
+            globs: '**/*.py'
+        empty: true
+  job:
+    transformation:
+      maxConcurrentRuns: 2
+      maxConcurrency: 1
+  stateMachine:
+    retry:
+      - ErrorEquals: [ "States.ALL" ]
+        IntervalSeconds: 3
+        MaxAttempts: 2
+        BackoffRate: 1.5
+    catch:
+      - ErrorEquals: [ 'States.ALL' ]
+        ResultPath: $.Error
+        Next: HandleError
+    wait:
+      crawler:
+        statusCheckInSeconds: 320
+  prune:
+    automatic: true
+    number: 5
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'dev'}
+  region: us-east-1
+  # In seconds
+  timeout: 600
+  versionFunctions: false
+  stackTags:  # These tags are set for the stack itself and also used as default values for all resources
+    Project: "etl-pipeline"
+  environment:
+    STAGE: ${self:provider.stage}
+
+resources:
+  Resources:
+    # Roles
+    GlueServiceRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - "glue.amazonaws.com"
+              Action:
+                - "sts:AssumeRole"
+        Path: "/"
+        Policies:
+          - PolicyName: GlueServiceRolePolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action: "*"
+                  Resource: "*"
+    OrchestrationStateMachineServiceRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - "Fn::Join": [
+                      "", [
+                        "states.",
+                      {
+                        "Ref": "AWS::Region"
+                      },
+                        ".amazonaws.com"
+                    ]
+                  ]
+              Action:
+                - "sts:AssumeRole"
+        Path: "/"
+        Policies:
+          - PolicyName: OrchestrationStateMachineServiceRolePolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action: "*"
+                  Resource: "*"
+    EtlLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: "/"
+        Policies:
+          - PolicyName: EtlLambdaRolePolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Resource:
+                    - "*"
+                  Action:
+                    - "*"
+
+    # Databases
+    LandingDatabase:
+      Type: AWS::Glue::Database
+      Properties:
+        CatalogId: !Ref "AWS::AccountId"
+        DatabaseInput:
+          Name: etl_landing
+    ProcessedDatabase:
+      Type: AWS::Glue::Database
+      Properties:
+        CatalogId: !Ref "AWS::AccountId"
+        DatabaseInput:
+          Name: etl_processed
+
+    # S3 Buckets
+    TransformationJobScriptS3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: "etl-transformation-job-scripts"
+        AccessControl: "BucketOwnerFullControl"
+    LandingS3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: "etl-landing"
+        AccessControl: "BucketOwnerFullControl"
+    ProcessedS3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: "etl-processed"
+        AccessControl: "BucketOwnerFullControl"
+
+    # Crawlers
+    LandingCrawler:
+      Type: AWS::Glue::Crawler
+      Properties:
+        DatabaseName: !Ref LandingDatabase
+        Configuration: '{"Version":1,"Grouping":{"TableLevelConfiguration":2,"TableGroupingPolicy":"CombineCompatibleSchemas"}}'
+        Name: LandingCrawler
+        Role:
+          "Fn::GetAtt": [ GlueServiceRole, Arn ]
+        SchemaChangePolicy:
+          DeleteBehavior: DEPRECATE_IN_DATABASE
+          UpdateBehavior: UPDATE_IN_DATABASE
+        Targets:
+          S3Targets:
+            - Path:
+                "Fn::Join": [
+                    "", [
+                      "s3://",
+                    {
+                      "Ref": "LandingS3Bucket"
+                    }
+                  ]
+                ]
+    ProcessedCrawler:
+      Type: AWS::Glue::Crawler
+      Properties:
+        DatabaseName: !Ref ProcessedDatabase
+        Configuration: '{"Version":1,"Grouping":{"TableLevelConfiguration":2,"TableGroupingPolicy":"CombineCompatibleSchemas"}}'
+        Name: ProcessedCrawler
+        Role:
+          "Fn::GetAtt": [ GlueServiceRole, Arn ]
+        SchemaChangePolicy:
+          DeleteBehavior: DEPRECATE_IN_DATABASE
+          UpdateBehavior: UPDATE_IN_DATABASE
+        Targets:
+          S3Targets:
+            - Path:
+                "Fn::Join": [
+                    "", [
+                      "s3://",
+                    {
+                      "Ref": "ProcessedS3Bucket"
+                    }
+                  ]
+                ]
+
+    # Job
+    TransformationGlueJob:
+      Type: AWS::Glue::Job
+      Properties:
+        Command:
+          Name: glueetl
+          ScriptLocation:
+            "Fn::Join": [
+                "", [
+                  "s3://",
+                {
+                  "Ref": "TransformationJobScriptS3Bucket"
+                },
+                  "/job.py"
+              ]
+            ]
+        DefaultArguments:
+          "--job-bookmark-option": "job-bookmark-enable"
+        AllocatedCapacity: 2
+        ExecutionProperty:
+          MaxConcurrentRuns: ${self:custom.job.transformation.maxConcurrentRuns}
+        MaxRetries: 0
+        Name: TransformationGlueJob
+        # In minutes
+        Timeout: 10
+        Role:
+          "Fn::GetAtt": [ GlueServiceRole, Arn ]
+
+    # SSM
+    LandingS3BucketArn:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: "/${self:provider.stage}/data_lake/s3"
+        Type: String
+        Value: !Ref LandingS3Bucket
+
+functions:
+  StartCrawler:
+    handler: lambda/start_crawler.lambda_handler
+    runtime: python3.7
+    memorySize: 256
+    role:
+      "Fn::GetAtt": [ EtlLambdaRole, Arn ]
+
+  GetCrawler:
+    handler: lambda/get_crawler.lambda_handler
+    runtime: python3.7
+    memorySize: 256
+    role:
+      "Fn::GetAtt": [ EtlLambdaRole, Arn ]
+
+  GetTables:
+    handler: lambda/get_tables.lambda_handler
+    runtime: python3.7
+    memorySize: 512
+    role:
+      "Fn::GetAtt": [ EtlLambdaRole, Arn ]
+    environment:
+      DB_NAME: !Ref LandingDatabase
+
+  EtlHandlerError:
+    handler: lambda/handle_error.lambda_handler
+    runtime: python3.7
+    memorySize: 256
+    role:
+      "Fn::GetAtt": [ EtlLambdaRole, Arn ]
+
+stepFunctions:
+  stateMachines:
+    EtlOrchestrationPipeline:
+      name: EtlOrchestrationPipeline
+      role:
+        "Fn::GetAtt": [ OrchestrationStateMachineServiceRole, Arn ]
+      events:
+        - schedule:
+            rate: rate(24 hours)
+      definition:
+        StartAt: StartLandingCrawler
+        States:
+          # Landing Crawler
+          StartLandingCrawler:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [StartCrawler, Arn]
+            Parameters:
+              'crawler_name': !Ref LandingCrawler
+            OutputPath: $
+            ResultPath: $.LandingCrawler
+            Next: WaitLandingCrawler
+            Retry: ${self:custom.stateMachine.retry}
+            Catch: ${self:custom.stateMachine.catch}
+          WaitLandingCrawler:
+            Type: Wait
+            Seconds: ${self:custom.stateMachine.wait.crawler.statusCheckInSeconds}
+            Next: GetLandingCrawler
+          GetLandingCrawler:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ GetCrawler, Arn ]
+            Parameters:
+              'crawler_name': !Ref LandingCrawler
+            OutputPath: $
+            ResultPath: $.LandingCrawlerStatus
+            Next: CheckLandingCrawlerStatus
+            Retry: ${self:custom.stateMachine.retry}
+            Catch: ${self:custom.stateMachine.catch}
+          CheckLandingCrawlerStatus:
+            Type: Choice
+            Choices:
+              - Variable: '$.LandingCrawlerStatus'
+                StringEquals: READY
+                Next: GetTables
+            Default: WaitLandingCrawler
+          # Transformation Job
+          GetTables:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ GetTables, Arn ]
+            OutputPath: $
+            ResultPath: $.Tables
+            Next: StartTransformationJobsRun
+            Retry: ${self:custom.stateMachine.retry}
+            Catch: ${self:custom.stateMachine.catch}
+          StartTransformationJobsRun:
+            Type: Map
+            ItemsPath: $.Tables
+            MaxConcurrency: ${self:custom.job.transformation.maxConcurrency}
+            Parameters:
+              "Table.$": "$$.Map.Item.Value"
+            Iterator:
+              StartAt: StartTransformationJobRun
+              States:
+                StartTransformationJobRun:
+                  Type: Task
+                  Resource: arn:aws:states:::glue:startJobRun.sync
+                  Parameters:
+                    JobName: !Ref TransformationGlueJob
+                    Arguments:
+                      '--source_db': !Ref LandingDatabase
+                      '--table.$': "$.Table"
+                      '--partition_keys': ${ self:custom.etl.partitions }
+                      '--target_storage':
+                        "Fn::Join": [
+                            "", [
+                              "s3://",
+                            {
+                              "Ref": "ProcessedS3Bucket"
+                            }
+                          ]
+                        ]
+                  End: true
+                  Retry: ${ self:custom.stateMachine.retry }
+                  Catch:
+                    - ErrorEquals: [ 'States.ALL' ]
+                      ResultPath: "$.TransformationJobError"
+                      Next: HandleTransformationJobError
+                HandleTransformationJobError:
+                  Type: Task
+                  Resource:
+                    Fn::GetAtt: [ EtlHandlerError, Arn ]
+                  Parameters:
+                    "error.$": "$.TransformationJobError"
+                  Next: FailureTransformationJob
+                  Retry: ${self:custom.stateMachine.retry}
+                  Catch:
+                    - ErrorEquals: [ 'States.ALL' ]
+                      Next: FailureTransformationJob
+                FailureTransformationJob:
+                  Type: Fail
+            ResultPath: $.TransformationJobsResult
+            Next: StartProcessedCrawler
+            Catch:
+              - ErrorEquals: [ 'States.ALL' ]
+                Next: Failure
+          # Parquet Crawler
+          StartProcessedCrawler:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ StartCrawler, Arn ]
+            Parameters:
+              'crawler_name': !Ref ProcessedCrawler
+            OutputPath: $
+            ResultPath: $.ProcessedCrawler
+            Next: WaitProcessedCrawler
+            Retry: ${self:custom.stateMachine.retry}
+            Catch: ${self:custom.stateMachine.catch}
+          WaitProcessedCrawler:
+            Type: Wait
+            Seconds: ${self:custom.stateMachine.wait.crawler.statusCheckInSeconds}
+            Next: GetProcessedCrawler
+          GetProcessedCrawler:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ GetCrawler, Arn ]
+            Parameters:
+              'crawler_name': !Ref ProcessedCrawler
+            OutputPath: $
+            ResultPath: $.ProcessedCrawlerStatus
+            Next: CheckProcessedCrawlerStatus
+            Retry: ${self:custom.stateMachine.retry}
+            Catch: ${self:custom.stateMachine.catch}
+          CheckProcessedCrawlerStatus:
+            Type: Choice
+            Choices:
+              - Variable: '$.ProcessedCrawlerStatus'
+                StringEquals: READY
+                Next: Success
+            Default: WaitProcessedCrawler
+          # Common
+          Success:
+            Type: Succeed
+          HandleError:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ EtlHandlerError, Arn ]
+            Parameters:
+              "error.$": "$.Error"
+            Next: Failure
+            Retry: ${self:custom.stateMachine.retry}
+            Catch:
+              - ErrorEquals: [ 'States.ALL' ]
+                Next: Failure
+          Failure:
+            Type: Fail

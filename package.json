@@ -1,0 +1,23 @@
+{
+  "name": "etl-pipeline",
+  "version": "1.0.0",
+  "description": "",
+  "main": "serverless.yml",
+  "scripts": {
+    "deploy": "sls deploy -v",
+    "destroy": "sls remove",
+    "npm-update": "ncu -u && npm i",
+    "test": "echo \"Warn: No test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "npm-check-updates": "^11.8.3",
+    "serverless": "^2.52.1",
+    "serverless-prune-plugin": "^1.5.1",
+    "serverless-python-requirements": "^5.1.1",
+    "serverless-s3-deploy": "^0.10.1",
+    "serverless-step-functions": "^2.32.0"
+  }
+}
